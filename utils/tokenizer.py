@@ -1,24 +1,27 @@
+import logging
 import os
 import re
 import textwrap
 from functools import cached_property
 
-import pypinyin
 import torch
-from hangul_romanize import Transliter
-from hangul_romanize.rule import academic
 from num2words import num2words
 from spacy.lang.ar import Arabic
 from spacy.lang.en import English
 from spacy.lang.es import Spanish
+from spacy.lang.hi import Hindi
 from spacy.lang.ja import Japanese
 from spacy.lang.zh import Chinese
 from tokenizers import Tokenizer
 
 from TTS.tts.layers.xtts.zh_num2words import TextNorm as zh_num2words
+from TTS.tts.utils.text.cleaners import collapse_whitespace, lowercase
+
+logger = logging.getLogger(__name__)
 
 
 def get_spacy_lang(lang):
+    """Return Spacy language used for sentence splitting."""
     if lang == "zh":
         return Chinese()
     elif lang == "ja":
@@ -27,8 +30,10 @@ def get_spacy_lang(lang):
         return Arabic()
     elif lang == "es":
         return Spanish()
+    elif lang == "hi":
+        return Hindi()
     else:
-        # For most languages, Enlish does the job
+        # For most languages, English does the job
         return English()
 
 
@@ -67,8 +72,6 @@ def split_sentence(text, lang, text_split_length=250):
 
     return text_splits
 
-
-_whitespace_re = re.compile(r"\s+")
 
 # List of (regular expression, replacement) pairs for abbreviations:
 _abbreviations = {
@@ -229,17 +232,10 @@ _abbreviations = {
             # Korean doesn't typically use abbreviations in the same way as Latin-based scripts.
         ]
     ],
-    "ja": [
-        (re.compile("\\b%s\\b" % x[0]), x[1])
+    "hi": [
+        (re.compile("\\b%s\\." % x[0], re.IGNORECASE), x[1])
         for x in [
-            ("氏", "さん"),  # Mr.
-            ("夫人", "おんなのひと"),  # Mrs.
-            ("博士", "はかせ"),  # Doctor or PhD
-            ("株", "株式会社"),  # Corporation
-            ("有", "有限会社"),  # Limited company
-            ("大学", "だいがく"),   # University
-            ("先生", "せんせい"),   # Teacher/Professor/Master
-            ("君", "くん")   # Used at the end of boys' names to express familiarity or affection.
+            # Hindi doesn't typically use abbreviations in the same way as Latin-based scripts.
         ]
     ],
 }
@@ -438,17 +434,17 @@ _symbols_multilingual = {
             ("°", " 도 "),
         ]
     ],
-    "ja": [
-        (re.compile(r"%s" % re.escape(x[0])), x[1])
+    "hi": [
+        (re.compile(r"%s" % re.escape(x[0]), re.IGNORECASE), x[1])
         for x in [
-            ("&", " と "),
-            ("@", " アットマーク "),
-            ("%", " パーセント "),
-            ("#", " ナンバー "),
-            ("$", " ドル "),
-            ("£", " ポンド "),
-            ("°", " 度"),
-            ]
+            ("&", " और "),
+            ("@", " ऐट दी रेट "),
+            ("%", " प्रतिशत "),
+            ("#", " हैश "),
+            ("$", " डॉलर "),
+            ("£", " पाउंड "),
+            ("°", " डिग्री "),
+        ]
     ],
 }
 
@@ -475,7 +471,7 @@ _ordinal_re = {
     "tr": re.compile(r"([0-9]+)(\.|inci|nci|uncu|üncü|\.)"),
     "hu": re.compile(r"([0-9]+)(\.|adik|edik|odik|edik|ödik|ödike|ik)"),
     "ko": re.compile(r"([0-9]+)(번째|번|차|째)"),
-    "ja": re.compile(r"([0-9]+)(番|回|つ|目|等|位)")
+    "hi": re.compile(r"([0-9]+)(st|nd|rd|th)"),  # To check
 }
 _number_re = re.compile(r"[0-9]+")
 _currency_re = {
@@ -527,6 +523,7 @@ def _expand_currency(m, lang="en", currency="USD"):
         "tr": ", ",
         "hu": ", ",
         "ko": ", ",
+        "hi": ", ",
     }
 
     if amount.is_integer():
@@ -566,14 +563,6 @@ def expand_numbers_multilingual(text, lang="en"):
     return text
 
 
-def lowercase(text):
-    return text.lower()
-
-
-def collapse_whitespace(text):
-    return re.sub(_whitespace_re, " ", text)
-
-
 def multilingual_cleaners(text, lang):
     text = text.replace('"', "")
     if lang == "tr":
@@ -588,14 +577,11 @@ def multilingual_cleaners(text, lang):
     return text
 
 
-def basic_cleaners(text):
-    """Basic pipeline that lowercases and collapses whitespace without transliteration."""
-    text = lowercase(text)
-    text = collapse_whitespace(text)
-    return text
-
-
 def chinese_transliterate(text):
+    try:
+        import pypinyin
+    except ImportError as e:
+        raise ImportError("Chinese requires: pypinyin") from e
     return "".join(
         [p[0] for p in pypinyin.pinyin(text, style=pypinyin.Style.TONE3, heteronym=False, neutral_tone_with_five=True)]
     )
@@ -608,6 +594,11 @@ def japanese_cleaners(text, katsu):
 
 
 def korean_transliterate(text):
+    try:
+        from hangul_romanize import Transliter
+        from hangul_romanize.rule import academic
+    except ImportError as e:
+        raise ImportError("Korean requires: hangul_romanize") from e
     r = Transliter(academic)
     return r.translit(text)
 
@@ -637,6 +628,7 @@ class VoiceBpeTokenizer:
             "ja": 71,
             "hu": 224,
             "ko": 95,
+            "hi": 150,
         }
 
     @cached_property
@@ -649,12 +641,14 @@ class VoiceBpeTokenizer:
         lang = lang.split("-")[0]  # remove the region
         limit = self.char_limits.get(lang, 250)
         if len(txt) > limit:
-            print(
-                f"[!] Warning: The text length exceeds the character limit of {limit} for language '{lang}', this might cause truncated audio."
+            logger.warning(
+                "The text length exceeds the character limit of %d for language '%s', this might cause truncated audio.",
+                limit,
+                lang,
             )
 
     def preprocess_text(self, txt, lang):
-        if lang in {"ar", "cs", "de", "en", "es", "fr", "hu", "it", "nl", "pl", "pt", "ru", "tr", "zh", "ko"}:
+        if lang in {"ar", "cs", "de", "en", "es", "fr", "hi", "hu", "it", "nl", "pl", "pt", "ru", "tr", "zh", "ko"}:
             txt = multilingual_cleaners(txt, lang)
             if lang == "zh":
                 txt = chinese_transliterate(txt)
@@ -662,9 +656,6 @@ class VoiceBpeTokenizer:
                 txt = korean_transliterate(txt)
         elif lang == "ja":
             txt = japanese_cleaners(txt, self.katsu)
-        elif lang == "hi":
-            # @manmay will implement this
-            txt = basic_cleaners(txt)
         else:
             raise NotImplementedError(f"Language '{lang}' is not supported.")
         return txt
@@ -787,6 +778,9 @@ def test_expand_numbers_multilingual():
         ("12.5 초 안에.", "십이 점 다섯 초 안에.", "ko"),
         ("50 명의 병사가 있었다.", "오십 명의 병사가 있었다.", "ko"),
         ("이것은 1 번째 테스트입니다", "이것은 첫 번째 테스트입니다", "ko"),
+        # Hindi
+        ("12.5 सेकंड में।", "साढ़े बारह सेकंड में।", "hi"),
+        ("50 सैनिक थे।", "पचास सैनिक थे।", "hi"),
     ]
     for a, b, lang in test_cases:
         out = expand_numbers_multilingual(a, lang=lang)
@@ -856,6 +850,7 @@ def test_symbols_multilingual():
         ("Pilim %14 dolu.", "Pilim yüzde 14 dolu.", "tr"),
         ("Az akkumulátorom töltöttsége 14%", "Az akkumulátorom töltöttsége 14 százalék", "hu"),
         ("배터리 잔량이 14%입니다.", "배터리 잔량이 14 퍼센트입니다.", "ko"),
+        ("मेरे पास 14% बैटरी है।", "मेरे पास चौदह प्रतिशत बैटरी है।", "hi"),
     ]
 
     for a, b, lang in test_cases:
