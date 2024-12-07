@@ -1,10 +1,12 @@
-import logging
 import os
 import re
 import textwrap
 from functools import cached_property
 
+import pypinyin
 import torch
+from hangul_romanize import Transliter
+from hangul_romanize.rule import academic
 from num2words import num2words
 from spacy.lang.ar import Arabic
 from spacy.lang.en import English
@@ -15,13 +17,9 @@ from spacy.lang.zh import Chinese
 from tokenizers import Tokenizer
 
 from TTS.tts.layers.xtts.zh_num2words import TextNorm as zh_num2words
-from TTS.tts.utils.text.cleaners import collapse_whitespace, lowercase
-
-logger = logging.getLogger(__name__)
 
 
 def get_spacy_lang(lang):
-    """Return Spacy language used for sentence splitting."""
     if lang == "zh":
         return Chinese()
     elif lang == "ja":
@@ -33,7 +31,7 @@ def get_spacy_lang(lang):
     elif lang == "hi":
         return Hindi()
     else:
-        # For most languages, English does the job
+        # For most languages, Enlish does the job
         return English()
 
 
@@ -72,6 +70,8 @@ def split_sentence(text, lang, text_split_length=250):
 
     return text_splits
 
+
+_whitespace_re = re.compile(r"\s+")
 
 # List of (regular expression, replacement) pairs for abbreviations:
 _abbreviations = {
@@ -471,7 +471,7 @@ _ordinal_re = {
     "tr": re.compile(r"([0-9]+)(\.|inci|nci|uncu|üncü|\.)"),
     "hu": re.compile(r"([0-9]+)(\.|adik|edik|odik|edik|ödik|ödike|ik)"),
     "ko": re.compile(r"([0-9]+)(번째|번|차|째)"),
-    "hi": re.compile(r"([0-9]+)(st|nd|rd|th)"),  # To check
+        "hi": re.compile(r"([0-9]+)(st|nd|rd|th)") # To check
 }
 _number_re = re.compile(r"[0-9]+")
 _currency_re = {
@@ -496,6 +496,9 @@ def _remove_dots(m):
     text = m.group(0)
     if "." in text:
         text = text.replace(".", "")
+    # For Hindi
+    elif "।" in text:
+        text = text.replace("।", "")
     return text
 
 
@@ -563,6 +566,14 @@ def expand_numbers_multilingual(text, lang="en"):
     return text
 
 
+def lowercase(text):
+    return text.lower()
+
+
+def collapse_whitespace(text):
+    return re.sub(_whitespace_re, " ", text)
+
+
 def multilingual_cleaners(text, lang):
     text = text.replace('"', "")
     if lang == "tr":
@@ -577,11 +588,14 @@ def multilingual_cleaners(text, lang):
     return text
 
 
+def basic_cleaners(text):
+    """Basic pipeline that lowercases and collapses whitespace without transliteration."""
+    text = lowercase(text)
+    text = collapse_whitespace(text)
+    return text
+
+
 def chinese_transliterate(text):
-    try:
-        import pypinyin
-    except ImportError as e:
-        raise ImportError("Chinese requires: pypinyin") from e
     return "".join(
         [p[0] for p in pypinyin.pinyin(text, style=pypinyin.Style.TONE3, heteronym=False, neutral_tone_with_five=True)]
     )
@@ -594,11 +608,6 @@ def japanese_cleaners(text, katsu):
 
 
 def korean_transliterate(text):
-    try:
-        from hangul_romanize import Transliter
-        from hangul_romanize.rule import academic
-    except ImportError as e:
-        raise ImportError("Korean requires: hangul_romanize") from e
     r = Transliter(academic)
     return r.translit(text)
 
@@ -641,14 +650,12 @@ class VoiceBpeTokenizer:
         lang = lang.split("-")[0]  # remove the region
         limit = self.char_limits.get(lang, 250)
         if len(txt) > limit:
-            logger.warning(
-                "The text length exceeds the character limit of %d for language '%s', this might cause truncated audio.",
-                limit,
-                lang,
+            print(
+                f"[!] Warning: The text length exceeds the character limit of {limit} for language '{lang}', this might cause truncated audio."
             )
 
     def preprocess_text(self, txt, lang):
-        if lang in {"ar", "cs", "de", "en", "es", "fr", "hi", "hu", "it", "nl", "pl", "pt", "ru", "tr", "zh", "ko"}:
+        if lang in {"ar", "cs", "de", "en", "es", "fr", "hu", "it", "nl", "pl", "pt", "ru", "tr", "zh", "ko", "hi"}:
             txt = multilingual_cleaners(txt, lang)
             if lang == "zh":
                 txt = chinese_transliterate(txt)
@@ -656,6 +663,9 @@ class VoiceBpeTokenizer:
                 txt = korean_transliterate(txt)
         elif lang == "ja":
             txt = japanese_cleaners(txt, self.katsu)
+        elif lang == "hi":
+            # @manmay will implement this
+            txt = basic_cleaners(txt)
         else:
             raise NotImplementedError(f"Language '{lang}' is not supported.")
         return txt
@@ -850,7 +860,7 @@ def test_symbols_multilingual():
         ("Pilim %14 dolu.", "Pilim yüzde 14 dolu.", "tr"),
         ("Az akkumulátorom töltöttsége 14%", "Az akkumulátorom töltöttsége 14 százalék", "hu"),
         ("배터리 잔량이 14%입니다.", "배터리 잔량이 14 퍼센트입니다.", "ko"),
-        ("मेरे पास 14% बैटरी है।", "मेरे पास चौदह प्रतिशत बैटरी है।", "hi"),
+        ("मेरे पास 14% बैटरी है।", "मेरे पास चौदह प्रतिशत बैटरी है।",  "hi"),
     ]
 
     for a, b, lang in test_cases:
